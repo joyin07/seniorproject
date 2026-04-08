@@ -9,12 +9,12 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../config/api';
 
 function QuizStructure() {
-    const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
+    //const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
     // Course selection
-    const [courses, setCourses] = useState<any[]>([]);
+    //const [courses, setCourses] = useState<any[]>([]);
     //Selected course ID (from dashboard)
     const [selectedCourseId, setSelectedCourseId] = useState<number | null>(null);
-    const [isLoadingCourses, setIsLoadingCourses] = useState(false);
+    //const [isLoadingCourses, setIsLoadingCourses] = useState(false);
 
     const [files, setFiles] = useState<any[]>([]);
     const [selectedFileIds, setSelectedFileIds] = useState<number[]>([]);
@@ -27,7 +27,7 @@ function QuizStructure() {
 
     // Quiz generation state
     const [isGenerating, setIsGenerating] = useState(false);
-    const [generatedQuiz, setGeneratedQuiz] = useState<any>(null);
+    //const [generatedQuiz, setGeneratedQuiz] = useState<any>(null);
     const [generateError, setGenerateError] = useState<string | null>(null);
 
     //Canvas Quiz Attributes 
