@@ -1,0 +1,164 @@
+import os
+import json
+import re
+from google import genai
+from dotenv import load_dotenv
+import httpx
+import io
+
+load_dotenv()
+
+QUIZ_PROMPT = """You are an expert educator and quiz creator. From all of the provided course materials combined, create exactly 5 challenging multiple-choice practice quiz questions that test deep understanding of the most important concepts.
+
+Return ONLY a valid JSON object with no extra text, markdown code fences, or explanation. Use this exact format:
+
+{
+  "questions": [
+    {
+      "question_stem": "The full question text here?",
+      "choices": [
+        { "text": "First option", "is_correct": false },
+        { "text": "Second option", "is_correct": true },
+        { "text": "Third option", "is_correct": false },
+        { "text": "Fourth option", "is_correct": false }
+      ],
+      "rationale": "Brief explanation of why the correct answer is correct."
+    }
+  ]
+}
+
+Rules:
+- Exactly 5 questions total across all provided materials
+- Each question must have exactly 4 choices
+- Exactly one choice per question must have is_correct set to true
+- Questions should be substantive and require understanding, not just recall
+- No markdown, no code fences, no text outside the JSON object"""
+
+"""
+    Generate a multiple-choice quiz from a list of Canvas file URLs.
+
+    Args:
+        files: List of dicts with keys: 'url', 'display_name', 'content_type'
+        canvas_token: Canvas API token used to authenticate file downloads
+        gemini_token: Gemini API key for authentication
+
+    Returns:
+        Dict with 'questions' list, each containing: question, options, answer, rationale
+
+    Raises:
+        ValueError: If files list is empty or a file entry is missing a URL
+        RuntimeError: If any download, Gemini upload, or generation step fails
+    """
+def generate_quiz_from_files(files: list, canvas_token: str, gemini_token: str = None, previous_questions: list = None, question_count: int = 5) -> dict:
+    if not files:
+        raise ValueError("At least one file is required to generate a quiz.")
+
+    # Configure Gemini with user's token or fall back to env variable
+    api_key = gemini_token or os.getenv("GEMINI_KEY")
+    if not api_key:
+        raise ValueError("No Gemini API key provided. Please add your Gemini API key in settings.")
+    
+    client = genai.Client(api_key=api_key)
+
+    headers = {"Authorization": f"Bearer {canvas_token}"}
+    uploaded_files = []
+
+    try:
+        # Download each file from Canvas and upload to Gemini
+        for i, file_info in enumerate(files):
+            url = file_info.get("url")
+            display_name = file_info.get("display_name", f"file_{i}")
+            content_type = file_info.get("content_type", "application/pdf")
+
+            if not url:
+                raise ValueError(f"File at index {i} is missing a 'url'.")
+
+            print(f"Downloading file {i + 1}/{len(files)}: {display_name}")
+            try:
+                with httpx.Client(follow_redirects=True, timeout=30.0) as h_client:
+                    dl_response = h_client.get(url, headers=headers)
+            except httpx.TimeoutException:
+                raise RuntimeError(f"Timed out downloading '{display_name}' from Canvas.")
+            except httpx.RequestError as e:
+                raise RuntimeError(f"Network error downloading '{display_name}': {str(e)}")
+
+            if dl_response.status_code != 200:
+                raise RuntimeError(
+                    f"Failed to download '{display_name}' from Canvas "
+                    f"(HTTP {dl_response.status_code})."
+                )
+
+            print(f"Uploading '{display_name}' to Gemini...")
+            file_io = io.BytesIO(dl_response.content)
+            file_io.seek(0)
+
+            try:
+                file_upload = client.files.upload(
+                    file=file_io,
+                    config={"mime_type": content_type, "display_name": display_name}
+                )
+                uploaded_files.append(file_upload)
+            except Exception as e:
+                raise RuntimeError(f"Failed to upload '{display_name}' to Gemini: {str(e)}")
+
+        # Generate quiz: pass all uploaded files + the structured prompt
+        print(f"Generating quiz from {len(uploaded_files)} file(s)...")
+        prompt = QUIZ_PROMPT.replace("exactly 5", f"exactly {question_count}").replace("Exactly 5", f"Exactly {question_count}")
+        if previous_questions:
+            prev_json = json.dumps(previous_questions, indent=2)
+            prompt += f"\n\nThe following questions already exist from previous quizzes. Do not duplicate them — use them as context for topic coverage and style:\n{prev_json}"
+        contents = uploaded_files + [prompt]
+
+        try:
+            gemini_response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config={"response_mime_type": "application/json"}
+            )
+        except Exception as e:
+            raise RuntimeError(f"Gemini content generation failed: {str(e)}")
+
+        # Step 3: Parse the JSON response
+        raw_text = gemini_response.text.strip()
+
+        # Strip markdown code fences in case Gemini wraps the output anyway
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+        raw_text = re.sub(r"\s*```$", "", raw_text)
+        raw_text = raw_text.strip()
+
+        try:
+            quiz_data = json.loads(raw_text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Gemini returned invalid JSON: {str(e)}. "
+                f"Raw response preview: {raw_text[:300]}"
+            )
+
+        if "questions" not in quiz_data or not isinstance(quiz_data["questions"], list):
+            raise RuntimeError(
+                "Gemini response is missing the 'questions' field or it is not a list."
+            )
+
+        return quiz_data
+
+    finally:
+        # Best-effort cleanup: delete uploaded files from Gemini's servers
+        for uploaded in uploaded_files:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    import os
+    test_files = [
+        {
+            "url": "https://ufl.instructure.com/files/105079458/download?download_frd=1&verifier=fLAcntrkIOwpDeBbldHFSg8D8lcnWTz2zWt0Ffns",
+            "display_name": "1 - Algorithmic Analysis.pdf",
+            "content_type": "application/pdf"
+        }
+    ]
+    result = generate_quiz_from_files(test_files, os.getenv("CANVAS_TOKEN"), os.getenv("GEMINI_KEY"))
+    print("\n--- GENERATED QUIZ ---")
+    print(json.dumps(result, indent=2))

@@ -1,0 +1,6 @@
+.DS_Store
+.env
+node_modules/
+__pycache__/
+*.pyc
+backend/test_llm_query.py

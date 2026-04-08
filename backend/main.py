@@ -1,0 +1,530 @@
+"""
+MAIN API SERVER - MongoDB Version
+- entry point that runs backend
+- FastAPI creates the web server
+- CORS allows frontend to talk to backend
+- get_current_user() checks if someone is logged in before getting protected routes
+- Routes
+    / = basic check if server is running
+    /api/me = returns logged-in user info (protected - needs login)
+    /api/tokens = saves Canvas and Gemini tokens (protected)
+    /api/onboarding-status = checks if user has completed onboarding (protected)
+    /api/sync-courses = fetches user's Canvas courses and stores them (protected)
+"""
+
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ConfigDict
+import os
+import httpx
+import uuid
+import json
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+from bson import ObjectId
+from database import get_or_create_user, update_user, users_collection, course_quizzes_collection, init_db, user_has_tokens
+from clerk_auth import verify_clerk_token
+from canvas_retriever import CanvasContentRetriever
+from gemini_retriever import generate_quiz_from_files
+from canvas_publisher import publish_quiz_to_canvas
+import markdown as md_lib
+from encryption import encrypt, decrypt
+
+load_dotenv()
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Request models
+class TokensRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    
+    canvas_token: str = Field(alias="canvasToken")
+    gemini_token: str = Field(alias="geminiToken")
+
+
+async def verify_gemini_token(api_key: str) -> bool:
+    """
+    Verify Gemini API key by making a simple API call.
+    Returns True if valid, raises exception if invalid.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+        
+        if response.status_code == 200:
+            return True
+        elif response.status_code == 400:
+            raise ValueError("Invalid Gemini API key format")
+        elif response.status_code == 403:
+            raise ValueError("Gemini API key is invalid or has been revoked")
+        else:
+            raise ValueError(f"Failed to verify Gemini API key: {response.status_code}")
+
+
+class FileInfo(BaseModel):
+    url: str
+    display_name: str
+    content_type: str = "application/pdf"
+
+class GenerateQuizRequest(BaseModel):
+    files: list[FileInfo]
+    course_id: int | None = None
+    quiz_ids: list[int] = []
+    question_count: int = 5
+    title: str = "Generated Practice Quiz"
+
+
+async def get_current_user(authorization: str = Header(...)) -> dict:
+    token = authorization.replace("Bearer ", "")
+    clerk_data = await verify_clerk_token(token)
+    
+    user_data = {
+        "email": clerk_data.get("email"),
+        "first_name": clerk_data.get("first_name"),
+        "last_name": clerk_data.get("last_name")
+    }
+    
+    user = get_or_create_user(clerk_data.get("sub"), user_data)
+    return user
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+@app.get("/")
+async def root():
+    return {"status": "running"}
+
+@app.get("/api/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Returns logged-in user info including onboarding status"""
+    return {
+        "id": str(current_user["_id"]),
+        "clerk_id": current_user["clerk_id"],
+        "university_id": current_user.get("university_id"),
+        "canvas_user_id": current_user.get("canvas_user_id"),
+        "email": current_user.get("email"),
+        "first_name": current_user.get("first_name"),
+        "last_name": current_user.get("last_name"),
+        "has_canvas_token": current_user.get("canvas_token") is not None,
+        "has_gemini_token": current_user.get("gemini_token") is not None,
+        "onboarding_complete": user_has_tokens(current_user)
+    }
+
+
+@app.post("/api/tokens")
+async def save_tokens(
+    tokens: TokensRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Save Canvas and Gemini tokens for user.
+    Validates both tokens before saving.
+    """
+    
+    # Verify Canvas token works by fetching courses
+    try:
+        canvas = CanvasContentRetriever(
+            canvas_url="https://ufl.instructure.com",
+            access_token=tokens.canvas_token
+        )
+        courses = canvas.get_courses()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Canvas token: {str(e)}")
+    
+    # Verify Gemini API key
+    try:
+        await verify_gemini_token(tokens.gemini_token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Encrypt and save tokens
+    try:
+        update_user(current_user["clerk_id"], {
+            "canvas_token": encrypt(tokens.canvas_token),
+            "gemini_token": encrypt(tokens.gemini_token)
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save tokens: {str(e)}")
+    
+    return {
+        "message": "Tokens saved successfully",
+        "onboarding_complete": True
+    }
+
+
+@app.get("/api/onboarding-status")
+async def get_onboarding_status(current_user: dict = Depends(get_current_user)):
+    """Check if user has completed onboarding (has both tokens)"""
+    return {
+        "has_canvas_token": current_user.get("canvas_token") is not None,
+        "has_gemini_token": current_user.get("gemini_token") is not None,
+        "onboarding_complete": user_has_tokens(current_user)
+    }
+
+
+"""
+Fetches user's Canvas courses and returns: courses_synced (count) and courses list.
+Each course has: id, name, course_code, enrollments (role + enrollment_state).
+Note: frontend should only show courses where role is "TeacherEnrollment" on the dashboard, since "StudentEnrollment" users can't create or publish quizzes.
+
+Example return:
+{
+  "courses_synced": 13,
+  "courses":
+  [
+    {
+      "id": 555100,
+      "name": "CAI6108 - ML Engineering",
+      "course_code": "CAI6108",
+      "enrollments":
+      [
+        {
+          "role": "StudentEnrollment",
+          "enrollment_state": "active"
+        }
+      ]
+    }
+]
+}
+"""
+@app.post("/api/sync-courses")
+async def sync_courses(current_user: dict = Depends(get_current_user)):
+    encrypted_canvas = current_user.get("canvas_token")
+    canvas_token = decrypt(encrypted_canvas) if encrypted_canvas else os.getenv("CANVAS_TOKEN")
+    if not canvas_token:
+         raise HTTPException(status_code=400, detail="No Canvas token found. Please add your Canvas API token.")
+    canvas = CanvasContentRetriever(
+        canvas_url="https://ufl.instructure.com",
+        access_token=canvas_token
+    )
+
+    try:
+        courses = canvas.get_courses()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch courses from Canvas: {str(e)}")
+
+    # Save courses to user's document in MongoDB
+    update_user(current_user["clerk_id"], {"courses": courses})
+
+    return {"courses_synced": len(courses), "courses": courses}
+
+
+"""
+Retrieves all quizzes for a given course from Canvas.
+This function should be called every time an instructor tries to make a new quiz. If a quiz's metadata is not in MongoDB, a new Mongo document will be made for it at this point.
+Example return:
+{
+  "quiz_count": 1,
+  "quizzes":
+  [
+    {
+      "id": 1582529,
+      "title": "API TEST Mock Quiz",
+      "description": "Practice quiz created via the Canvas API (safe to ignore).",
+      "html_url": "https://ufl.instructure.com/courses/389226/quizzes/1582529",
+      "question_count": 0,
+      "points_possible": 0,
+      "due_at": null,
+      "published": false
+    }
+  ]
+}
+"""
+@app.get("/api/courses/{course_id}/quizzes")
+async def retrieve_quizzes(course_id: int, current_user: dict = Depends(get_current_user)):
+    encrypted_canvas = current_user.get("canvas_token")
+    canvas_token = decrypt(encrypted_canvas) if encrypted_canvas else os.getenv("CANVAS_TOKEN")
+    if not canvas_token:
+          raise HTTPException(status_code=400, detail="No Canvas token found. Please add your Canvas API token.")
+
+    canvas = CanvasContentRetriever(
+        canvas_url="https://ufl.instructure.com",
+        access_token=canvas_token
+    )
+
+    try:
+        quizzes = canvas.get_course_quizzes(course_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch quizzes from Canvas: {str(e)}")
+    return {"quiz_count": len(quizzes), "quizzes": quizzes}
+
+
+"""
+Retrieves all files for a given course from Canvas.
+Each file has: id, display_name, url (direct download), updated_at, size (bytes), mime_class, content-type.
+Example return:
+{
+  "file_count": 1,
+  "files": [
+    {
+      "id": 63265314,
+      "folder_id": 6794316,
+      "display_name": "0_Introduction_and_CourseOverview.pdf",
+      "filename": "0_Introduction_and_CourseOverview.pdf",
+      "content-type": "application/pdf",
+      "url": "https://ufl.instructure.com/files/63265314/download?download_frd=1&verifier=th6QWGRXtjNiourZyexyOM2FX2n8lDFRmqNXYCy9",
+      "size": 1887556,
+      "created_at": "2021-01-12T22:15:59Z",
+      "updated_at": "2021-10-20T16:41:21Z",
+      "modified_at": "2021-01-12T22:15:59Z",
+      "mime_class": "pdf"
+    }
+  ]
+}
+"""
+@app.get("/api/courses/{course_id}/files")
+async def retrieve_files(course_id: int, current_user: dict = Depends(get_current_user)):
+    encrypted_canvas = current_user.get("canvas_token")
+    canvas_token = decrypt(encrypted_canvas) if encrypted_canvas else os.getenv("CANVAS_TOKEN")
+    if not canvas_token:
+         raise HTTPException(status_code=400, detail="No Canvas token found. Please add your Canvas API token.")
+
+    canvas = CanvasContentRetriever(
+        canvas_url="https://ufl.instructure.com",
+        access_token=canvas_token
+    )
+
+    try:
+        files = canvas.get_course_files(course_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch files from Canvas: {str(e)}")
+
+    return {"file_count": len(files), "files": files}
+
+
+"""
+Retrieves all questions for a given quiz from Canvas.
+Each question has: id, question_name, question_text (HTML), question_type, points_possible, answers (with weight indicating correctness: 100 = correct, 0 = incorrect).
+Example return:
+{
+  "question_count": 1,
+  "questions": [
+    {
+      "id": 23919174,
+      "question_name": "Question",
+      "question_text": "<p>What is the computational complexity?</p>",
+      "question_type": "multiple_choice_question",
+      "points_possible": 1.0,
+      "answers": [
+        {"id": 8940, "text": "O(1)", "weight": 0},
+        {"id": 5589, "text": "O(n^2)", "weight": 100}
+      ]
+    }
+  ]
+}
+"""
+@app.get("/api/courses/{course_id}/quizzes/{quiz_id}/questions")
+async def retrieve_quiz_questions(course_id: int, quiz_id: int, current_user: dict = Depends(get_current_user)):
+    encrypted_canvas = current_user.get("canvas_token")
+    canvas_token = decrypt(encrypted_canvas) if encrypted_canvas else os.getenv("CANVAS_TOKEN")
+    if not canvas_token:
+         raise HTTPException(status_code=400, detail="No Canvas token found. Please add your Canvas API token.")
+
+    canvas = CanvasContentRetriever(
+        canvas_url="https://ufl.instructure.com",
+        access_token=canvas_token
+    )
+
+    try:
+        questions = canvas.get_quiz_questions(course_id, quiz_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch quiz questions from Canvas: {str(e)}")
+
+    return {"question_count": len(questions), "questions": questions}
+
+
+"""
+Generates a practice quiz from a list of Canvas file URLs using Gemini.
+Pass in files retrieved from /api/courses/{course_id}/files.
+Returns 5 multiple-choice questions with options, answer, and rationale.
+Example request body:
+{
+  "files": [
+    {
+      "url": "https://ufl.instructure.com/files/123/download?...",
+      "display_name": "lecture1.pdf",
+      "content_type": "application/pdf"
+    }
+  ]
+}
+"""
+@app.post("/api/generate-quiz")
+async def generate_quiz(body: GenerateQuizRequest, current_user: dict = Depends(get_current_user)):
+    encrypted_canvas = current_user.get("canvas_token")
+    canvas_token = decrypt(encrypted_canvas) if encrypted_canvas else os.getenv("CANVAS_TOKEN")
+    if not canvas_token:
+        raise HTTPException(status_code=400, detail="No Canvas token found. Please add your Canvas API token.")
+
+    encrypted_gemini = current_user.get("gemini_token")
+    gemini_token = decrypt(encrypted_gemini) if encrypted_gemini else os.getenv("GEMINI_KEY")
+    if not gemini_token:
+        raise HTTPException(status_code=400, detail="No Gemini API key found. Please add your Gemini API key.")
+    files = [f.model_dump() for f in body.files]
+
+    # Fetch questions from any previously selected quizzes
+    previous_questions = []
+    if body.course_id and body.quiz_ids:
+        canvas = CanvasContentRetriever(
+            canvas_url="https://ufl.instructure.com",
+            access_token=canvas_token
+        )
+        for quiz_id in body.quiz_ids:
+            try:
+                questions = canvas.get_quiz_questions(body.course_id, quiz_id)
+                previous_questions.extend(questions)
+            except Exception as e:
+                print(f"Warning: could not fetch questions for quiz {quiz_id}: {e}")
+
+    try:
+        quiz = generate_quiz_from_files(files, canvas_token, gemini_token, previous_questions, body.question_count)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    print("\n--- GENERATED QUIZ ---")
+    print(json.dumps(quiz, indent=2))
+    print("----------------------\n")
+
+    # Build internal MongoDB document from Gemini output
+    now = datetime.now(timezone.utc)
+    questions = []
+    for i, q in enumerate(quiz.get("questions", []), start=1):
+        question_id = str(uuid.uuid4())
+        choices = []
+        for j, c in enumerate(q.get("choices", []), start=1):
+            choices.append({
+                "internal_choice_id": str(uuid.uuid4()),
+                "position": j,
+                "text_html": md_lib.markdown(c['text']),
+                "is_correct": c.get("is_correct", False)
+            })
+        questions.append({
+            "internal_question_id": question_id,
+            "canvas_item_id": None,
+            "type": "multiple_choice",
+            "position": i,
+            "points_possible": 1,
+            "question_stem_html": md_lib.markdown(q['question_stem']),
+            "overall_rationale_html": md_lib.markdown(q.get('rationale', '')),
+            "choices": choices,
+            "publish_error": None
+        })
+
+    quiz_doc = {
+        "clerk_id": current_user["clerk_id"],
+        "course_id": body.course_id,
+        "assignment_id": None,
+        "new_quiz_id": None,
+        "title": body.title,
+        "description_html": "",
+        "question_count": len(questions),
+        "questions": questions,
+        "status": "generated_pending_review",
+        "created_at": now,
+        "updated_at": now,
+        "generation_metadata": {
+            "source_file_display_names": [f["display_name"] for f in files],
+            "source_prev_quiz_ids": body.quiz_ids,
+            "gemini_model_used": "gemini-2.5-flash"
+        },
+        "publish_metadata": {
+            "published_at": None,
+            "last_error": None
+        }
+    }
+
+    result = course_quizzes_collection.insert_one(quiz_doc)
+    print(f"Saved quiz to MongoDB with id: {result.inserted_id}")
+
+    return {"quiz_id": str(result.inserted_id), "questions": questions}
+
+
+@app.get("/api/quizzes/{quiz_id}")
+async def get_quiz(quiz_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        quiz_doc = course_quizzes_collection.find_one({
+            "_id": ObjectId(quiz_id),
+            "clerk_id": current_user["clerk_id"]
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid quiz id.")
+
+    if not quiz_doc:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+
+    quiz_doc["_id"] = str(quiz_doc["_id"])
+    return quiz_doc
+
+
+@app.post("/api/quizzes/{quiz_id}/publish")
+async def publish_quiz(quiz_id: str, current_user: dict = Depends(get_current_user)):
+    encrypted_canvas = current_user.get("canvas_token")
+    canvas_token = decrypt(encrypted_canvas) if encrypted_canvas else os.getenv("CANVAS_TOKEN")
+    if not canvas_token:
+        raise HTTPException(status_code=400, detail="No Canvas token found.")
+
+    # Fetch quiz doc from MongoDB
+    try:
+        quiz_doc = course_quizzes_collection.find_one({
+            "_id": ObjectId(quiz_id),
+            "clerk_id": current_user["clerk_id"]
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid quiz id.")
+
+    if not quiz_doc:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+
+    if quiz_doc["status"] == "published":
+        raise HTTPException(status_code=400, detail="Quiz is already published.")
+
+    # Publish to Canvas
+    try:
+        publish_result = publish_quiz_to_canvas(quiz_doc, canvas_token)
+    except RuntimeError as e:
+        course_quizzes_collection.update_one(
+            {"_id": ObjectId(quiz_id)},
+            {"$set": {
+                "status": "publish_failed",
+                "publish_metadata.last_error": str(e),
+                "updated_at": datetime.now(timezone.utc)
+            }}
+        )
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Write Canvas IDs back to MongoDB
+    now = datetime.now(timezone.utc)
+    question_updates = {
+        f"questions.{i}.canvas_item_id": q["canvas_item_id"]
+        for i, q in enumerate(publish_result["questions"])
+    }
+    course_quizzes_collection.update_one(
+        {"_id": ObjectId(quiz_id)},
+        {"$set": {
+            "status": "published",
+            "new_quiz_id": publish_result["new_quiz_id"],
+            "assignment_id": publish_result["assignment_id"],
+            "publish_metadata.published_at": now,
+            "publish_metadata.last_error": None,
+            "updated_at": now,
+            **question_updates
+        }}
+    )
+
+    return {
+        "quiz_id": quiz_id,
+        "new_quiz_id": publish_result["new_quiz_id"],
+        "assignment_id": publish_result["assignment_id"]
+    }
