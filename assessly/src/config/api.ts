@@ -7,7 +7,10 @@
 
 //const USE_MOCK = false; // Changed to false to use real backend
 
-const API_BASE = "http://localhost:8000";
+// const API_BASE = "http://localhost:8000";
+// deployment added 
+export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
 
 // Helper to get Clerk token
 async function getAuthHeaders() {

@@ -4,6 +4,9 @@ import {useState} from 'react';
 // import React, {useState} from 'react';
 import { useAuth } from '@clerk/clerk-react';
 import { useNavigate } from 'react-router-dom';
+// deployment added 
+import { API_BASE } from '../config/api';
+
 
 function Tokens({ onTokensSaved }: { onTokensSaved: () => void }) {
   const [canvasToken, setCanvasToken] = useState('');
@@ -21,8 +24,10 @@ function Tokens({ onTokensSaved }: { onTokensSaved: () => void }) {
     setLoading(true);
     try {
       const token = await getToken();
-      const response = await fetch('http://localhost:8000/api/tokens', {
-        method: 'POST',
+      //const response = await fetch('http://localhost:8000/api/tokens', {
+      // deployment added 
+      const response = await fetch(`${API_BASE}/api/tokens`, {  
+      method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
